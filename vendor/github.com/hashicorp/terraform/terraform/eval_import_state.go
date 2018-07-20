@@ -2,6 +2,10 @@ package terraform
 
 import (
 	"fmt"
+	"log"
+
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/tfdiags"
 )
 
 // EvalImportState is an EvalNode implementation that performs an
@@ -35,6 +39,14 @@ func (n *EvalImportState) Eval(ctx EvalContext) (interface{}, error) {
 			"import %s (id: %s): %s", n.Info.HumanId(), n.Id, err)
 	}
 
+	for _, s := range state {
+		if s == nil {
+			log.Printf("[TRACE] EvalImportState: import %s %q produced a nil state", n.Info.HumanId(), n.Id)
+			continue
+		}
+		log.Printf("[TRACE] EvalImportState: import %s %q produced state for %s with id %q", n.Info.HumanId(), n.Id, s.Ephemeral.Type, s.ID)
+	}
+
 	if n.Output != nil {
 		*n.Output = state
 	}
@@ -55,22 +67,26 @@ func (n *EvalImportState) Eval(ctx EvalContext) (interface{}, error) {
 // EvalImportStateVerify verifies the state after ImportState and
 // after the refresh to make sure it is non-nil and valid.
 type EvalImportStateVerify struct {
-	Info  *InstanceInfo
+	Addr  addrs.ResourceInstance
 	Id    string
 	State **InstanceState
 }
 
 // TODO: test
 func (n *EvalImportStateVerify) Eval(ctx EvalContext) (interface{}, error) {
+	var diags tfdiags.Diagnostics
+
 	state := *n.State
 	if state.Empty() {
-		return nil, fmt.Errorf(
-			"import %s (id: %s): Terraform detected a resource with this ID doesn't\n"+
-				"exist. Please verify the ID is correct. You cannot import non-existent\n"+
-				"resources using Terraform import.",
-			n.Info.HumanId(),
-			n.Id)
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Cannot import non-existent remote object",
+			fmt.Sprintf(
+				"While attempting to import an existing object to %s, the provider detected that no object exists with the id %q. Only pre-existing objects can be imported; check that the id is correct and that it is associated with the provider's configured region or endpoint, or use \"terraform apply\" to create a new remote object for this resource.",
+				n.Addr.String(), n.Id,
+			),
+		))
 	}
 
-	return nil, nil
+	return nil, diags.ErrWithWarnings()
 }

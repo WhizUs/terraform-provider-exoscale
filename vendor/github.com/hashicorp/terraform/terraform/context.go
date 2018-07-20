@@ -4,16 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 	"sync"
 
-	"github.com/hashicorp/terraform/tfdiags"
+	"github.com/hashicorp/terraform/lang"
 
-	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/terraform/addrs"
+
+	"github.com/hashicorp/terraform/configs"
+	"github.com/hashicorp/terraform/tfdiags"
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
 	"github.com/hashicorp/terraform/version"
 )
 
@@ -55,15 +58,15 @@ type ContextOpts struct {
 	Destroy            bool
 	Diff               *Diff
 	Hooks              []Hook
-	Module             *module.Tree
+	Config             *configs.Config
 	Parallelism        int
 	State              *State
 	StateFutureAllowed bool
 	ProviderResolver   ResourceProviderResolver
 	Provisioners       map[string]ResourceProvisionerFactory
 	Shadow             bool
-	Targets            []string
-	Variables          map[string]interface{}
+	Targets            []addrs.Targetable
+	Variables          InputValues
 
 	// If non-nil, will apply as additional constraints on the provider
 	// plugins that will be requested from the provider resolver.
@@ -92,23 +95,24 @@ type Context struct {
 	// fail regardless but putting this note here as well.
 
 	components contextComponentFactory
+	schemas    *Schemas
 	destroy    bool
 	diff       *Diff
 	diffLock   sync.RWMutex
 	hooks      []Hook
 	meta       *ContextMeta
-	module     *module.Tree
+	config     *configs.Config
 	sh         *stopHook
 	shadow     bool
 	state      *State
 	stateLock  sync.RWMutex
-	targets    []string
+	targets    []addrs.Targetable
 	uiInput    UIInput
-	variables  map[string]interface{}
+	variables  InputValues
 
 	l                   sync.Mutex // Lock acquired during any task
 	parallelSem         Semaphore
-	providerInputConfig map[string]map[string]interface{}
+	providerInputConfig map[string]map[string]cty.Value
 	providerSHA256s     map[string][]byte
 	runLock             sync.Mutex
 	runCond             *sync.Cond
@@ -119,15 +123,18 @@ type Context struct {
 
 // NewContext creates a new Context structure.
 //
-// Once a Context is creator, the pointer values within ContextOpts
-// should not be mutated in any way, since the pointers are copied, not
-// the values themselves.
-func NewContext(opts *ContextOpts) (*Context, error) {
-	// Validate the version requirement if it is given
-	if opts.Module != nil {
-		if err := CheckRequiredVersion(opts.Module); err != nil {
-			return nil, err
-		}
+// Once a Context is created, the caller should not access or mutate any of
+// the objects referenced (directly or indirectly) by the ContextOpts fields.
+//
+// If the returned diagnostics contains errors then the resulting context is
+// invalid and must not be used.
+func NewContext(opts *ContextOpts) (*Context, tfdiags.Diagnostics) {
+	diags := CheckCoreVersionRequirements(opts.Config)
+	// If version constraints are not met then we'll bail early since otherwise
+	// we're likely to just see a bunch of other errors related to
+	// incompatibilities, which could be overwhelming for the user.
+	if diags.HasErrors() {
+		return nil, diags
 	}
 
 	// Copy all the hooks and add our stop hook. We don't append directly
@@ -145,8 +152,9 @@ func NewContext(opts *ContextOpts) (*Context, error) {
 
 	// If our state is from the future, then error. Callers can avoid
 	// this error by explicitly setting `StateFutureAllowed`.
-	if err := CheckStateVersion(state); err != nil && !opts.StateFutureAllowed {
-		return nil, err
+	if stateDiags := CheckStateVersion(state, opts.StateFutureAllowed); stateDiags.HasErrors() {
+		diags = diags.Append(stateDiags)
+		return nil, diags
 	}
 
 	// Explicitly reset our state version to our current version so that
@@ -168,30 +176,42 @@ func NewContext(opts *ContextOpts) (*Context, error) {
 	//    2 - Take values specified in -var flags, overriding values
 	//        set by environment variables if necessary. This includes
 	//        values taken from -var-file in addition.
-	variables := make(map[string]interface{})
-	if opts.Module != nil {
-		var err error
-		variables, err = Variables(opts.Module, opts.Variables)
-		if err != nil {
-			return nil, err
-		}
+	var variables InputValues
+	if opts.Config != nil {
+		// Default variables from the configuration seed our map.
+		variables = DefaultVariableValues(opts.Config.Module.Variables)
 	}
+	// Variables provided by the caller (from CLI, environment, etc) can
+	// override the defaults.
+	variables = variables.Override(opts.Variables)
 
 	// Bind available provider plugins to the constraints in config
 	var providers map[string]ResourceProviderFactory
 	if opts.ProviderResolver != nil {
 		var err error
-		deps := ModuleTreeDependencies(opts.Module, state)
+		deps := ConfigTreeDependencies(opts.Config, state)
 		reqd := deps.AllPluginRequirements()
 		if opts.ProviderSHA256s != nil && !opts.SkipProviderVerify {
 			reqd.LockExecutables(opts.ProviderSHA256s)
 		}
 		providers, err = resourceProviderFactories(opts.ProviderResolver, reqd)
 		if err != nil {
-			return nil, err
+			diags = diags.Append(err)
+			return nil, diags
 		}
 	} else {
 		providers = make(map[string]ResourceProviderFactory)
+	}
+
+	components := &basicComponentFactory{
+		providers:    providers,
+		provisioners: opts.Provisioners,
+	}
+
+	schemas, err := LoadSchemas(opts.Config, opts.State, components)
+	if err != nil {
+		diags = diags.Append(err)
+		return nil, diags
 	}
 
 	diff := opts.Diff
@@ -200,23 +220,21 @@ func NewContext(opts *ContextOpts) (*Context, error) {
 	}
 
 	return &Context{
-		components: &basicComponentFactory{
-			providers:    providers,
-			provisioners: opts.Provisioners,
-		},
-		destroy:   opts.Destroy,
-		diff:      diff,
-		hooks:     hooks,
-		meta:      opts.Meta,
-		module:    opts.Module,
-		shadow:    opts.Shadow,
-		state:     state,
-		targets:   opts.Targets,
-		uiInput:   opts.UIInput,
-		variables: variables,
+		components: components,
+		schemas:    schemas,
+		destroy:    opts.Destroy,
+		diff:       diff,
+		hooks:      hooks,
+		meta:       opts.Meta,
+		config:     opts.Config,
+		shadow:     opts.Shadow,
+		state:      state,
+		targets:    opts.Targets,
+		uiInput:    opts.UIInput,
+		variables:  variables,
 
 		parallelSem:         NewSemaphore(par),
-		providerInputConfig: make(map[string]map[string]interface{}),
+		providerInputConfig: make(map[string]map[string]cty.Value),
 		providerSHA256s:     opts.ProviderSHA256s,
 		sh:                  sh,
 	}, nil
@@ -233,7 +251,7 @@ type ContextGraphOpts struct {
 // Graph returns the graph used for the given operation type.
 //
 // The most extensive or complex graph type is GraphTypePlan.
-func (c *Context) Graph(typ GraphType, opts *ContextGraphOpts) (*Graph, error) {
+func (c *Context) Graph(typ GraphType, opts *ContextGraphOpts) (*Graph, tfdiags.Diagnostics) {
 	if opts == nil {
 		opts = &ContextGraphOpts{Validate: true}
 	}
@@ -242,65 +260,70 @@ func (c *Context) Graph(typ GraphType, opts *ContextGraphOpts) (*Graph, error) {
 	switch typ {
 	case GraphTypeApply:
 		return (&ApplyGraphBuilder{
-			Module:       c.module,
-			Diff:         c.diff,
-			State:        c.state,
-			Providers:    c.components.ResourceProviders(),
-			Provisioners: c.components.ResourceProvisioners(),
-			Targets:      c.targets,
-			Destroy:      c.destroy,
-			Validate:     opts.Validate,
-		}).Build(RootModulePath)
+			Config:     c.config,
+			Diff:       c.diff,
+			State:      c.state,
+			Components: c.components,
+			Schemas:    c.schemas,
+			Targets:    c.targets,
+			Destroy:    c.destroy,
+			Validate:   opts.Validate,
+		}).Build(addrs.RootModuleInstance)
 
-	case GraphTypeInput:
-		// The input graph is just a slightly modified plan graph
-		fallthrough
 	case GraphTypeValidate:
 		// The validate graph is just a slightly modified plan graph
 		fallthrough
 	case GraphTypePlan:
 		// Create the plan graph builder
 		p := &PlanGraphBuilder{
-			Module:    c.module,
-			State:     c.state,
-			Providers: c.components.ResourceProviders(),
-			Targets:   c.targets,
-			Validate:  opts.Validate,
+			Config:     c.config,
+			State:      c.state,
+			Components: c.components,
+			Schemas:    c.schemas,
+			Targets:    c.targets,
+			Validate:   opts.Validate,
 		}
 
 		// Some special cases for other graph types shared with plan currently
 		var b GraphBuilder = p
 		switch typ {
-		case GraphTypeInput:
-			b = InputGraphBuilder(p)
 		case GraphTypeValidate:
-			// We need to set the provisioners so those can be validated
-			p.Provisioners = c.components.ResourceProvisioners()
-
 			b = ValidateGraphBuilder(p)
 		}
 
-		return b.Build(RootModulePath)
+		return b.Build(addrs.RootModuleInstance)
 
 	case GraphTypePlanDestroy:
 		return (&DestroyPlanGraphBuilder{
-			Module:   c.module,
+			Config:   c.config,
 			State:    c.state,
+			Schemas:  c.schemas,
 			Targets:  c.targets,
 			Validate: opts.Validate,
-		}).Build(RootModulePath)
+		}).Build(addrs.RootModuleInstance)
 
 	case GraphTypeRefresh:
 		return (&RefreshGraphBuilder{
-			Module:    c.module,
-			State:     c.state,
-			Providers: c.components.ResourceProviders(),
-			Targets:   c.targets,
-			Validate:  opts.Validate,
-		}).Build(RootModulePath)
-	}
+			Config:     c.config,
+			State:      c.state,
+			Components: c.components,
+			Schemas:    c.schemas,
+			Targets:    c.targets,
+			Validate:   opts.Validate,
+		}).Build(addrs.RootModuleInstance)
 
-	return nil, fmt.Errorf("unknown graph type: %s", typ)
+	case GraphTypeEval:
+		return (&EvalGraphBuilder{
+			Config:     c.config,
+			State:      c.state,
+			Components: c.components,
+			Schemas:    c.schemas,
+		}).Build(addrs.RootModuleInstance)
+
+	default:
+		// Should never happen, because the above is exhaustive for all graph types.
+		panic(fmt.Errorf("unsupported graph type %s", typ))
+	}
 }
 
 // ShadowError returns any errors caught during a shadow operation.
@@ -337,137 +360,71 @@ func (c *Context) State() *State {
 	return c.state.DeepCopy()
 }
 
-// Interpolater returns an Interpolater built on a copy of the state
-// that can be used to test interpolation values.
-func (c *Context) Interpolater() *Interpolater {
-	var varLock sync.Mutex
-	var stateLock sync.RWMutex
-	return &Interpolater{
-		Operation:          walkApply,
-		Meta:               c.meta,
-		Module:             c.module,
-		State:              c.state.DeepCopy(),
-		StateLock:          &stateLock,
-		VariableValues:     c.variables,
-		VariableValuesLock: &varLock,
+// Eval produces a scope in which expressions can be evaluated for
+// the given module path.
+//
+// This method must first evaluate any ephemeral values (input variables, local
+// values, and output values) in the configuration. These ephemeral values are
+// not included in the persisted state, so they must be re-computed using other
+// values in the state before they can be properly evaluated. The updated
+// values are retained in the main state associated with the receiving context.
+//
+// This function takes no action against remote APIs but it does need access
+// to all provider and provisioner instances in order to obtain their schemas
+// for type checking.
+//
+// The result is an evaluation scope that can be used to resolve references
+// against the root module. If the returned diagnostics contains errors then
+// the returned scope may be nil. If it is not nil then it may still be used
+// to attempt expression evaluation or other analysis, but some expressions
+// may not behave as expected.
+func (c *Context) Eval(path addrs.ModuleInstance) (*lang.Scope, tfdiags.Diagnostics) {
+	// This is intended for external callers such as the "terraform console"
+	// command. Internally, we create an evaluator in c.walk before walking
+	// the graph, and create scopes in ContextGraphWalker.
+
+	var diags tfdiags.Diagnostics
+	defer c.acquireRun("eval")()
+
+	// Start with a copy of state so that we don't affect any instances
+	// that other methods may have already returned.
+	c.state = c.state.DeepCopy()
+	var walker *ContextGraphWalker
+
+	graph, graphDiags := c.Graph(GraphTypeEval, nil)
+	diags = diags.Append(graphDiags)
+	if !diags.HasErrors() {
+		var walkDiags tfdiags.Diagnostics
+		walker, walkDiags = c.walk(graph, walkEval)
+		diags = diags.Append(walker.NonFatalDiagnostics)
+		diags = diags.Append(walkDiags)
+
+		// Clean out any unused things
+		c.state.prune()
 	}
+
+	if walker == nil {
+		// If we skipped walking the graph (due to errors) then we'll just
+		// use a placeholder graph walker here, which'll refer to the
+		// unmodified state.
+		walker = c.graphWalker(walkEval)
+	}
+
+	// This is a bit weird since we don't normally evaluate outside of
+	// the context of a walk, but we'll "re-enter" our desired path here
+	// just to get hold of an EvalContext for it. GraphContextBuiltin
+	// caches its contexts, so we should get hold of the context that was
+	// previously used for evaluation here, unless we skipped walking.
+	evalCtx := walker.EnterPath(path)
+	return evalCtx.EvaluationScope(nil, EvalDataForNoInstanceKey), diags
 }
 
-// Input asks for input to fill variables and provider configurations.
-// This modifies the configuration in-place, so asking for Input twice
-// may result in different UI output showing different current values.
-func (c *Context) Input(mode InputMode) error {
-	defer c.acquireRun("input")()
-
-	if mode&InputModeVar != 0 {
-		// Walk the variables first for the root module. We walk them in
-		// alphabetical order for UX reasons.
-		rootConf := c.module.Config()
-		names := make([]string, len(rootConf.Variables))
-		m := make(map[string]*config.Variable)
-		for i, v := range rootConf.Variables {
-			names[i] = v.Name
-			m[v.Name] = v
-		}
-		sort.Strings(names)
-		for _, n := range names {
-			// If we only care about unset variables, then if the variable
-			// is set, continue on.
-			if mode&InputModeVarUnset != 0 {
-				if _, ok := c.variables[n]; ok {
-					continue
-				}
-			}
-
-			var valueType config.VariableType
-
-			v := m[n]
-			switch valueType = v.Type(); valueType {
-			case config.VariableTypeUnknown:
-				continue
-			case config.VariableTypeMap:
-				// OK
-			case config.VariableTypeList:
-				// OK
-			case config.VariableTypeString:
-				// OK
-			default:
-				panic(fmt.Sprintf("Unknown variable type: %#v", v.Type()))
-			}
-
-			// If the variable is not already set, and the variable defines a
-			// default, use that for the value.
-			if _, ok := c.variables[n]; !ok {
-				if v.Default != nil {
-					c.variables[n] = v.Default.(string)
-					continue
-				}
-			}
-
-			// this should only happen during tests
-			if c.uiInput == nil {
-				log.Println("[WARN] Content.uiInput is nil")
-				continue
-			}
-
-			// Ask the user for a value for this variable
-			var value string
-			retry := 0
-			for {
-				var err error
-				value, err = c.uiInput.Input(&InputOpts{
-					Id:          fmt.Sprintf("var.%s", n),
-					Query:       fmt.Sprintf("var.%s", n),
-					Description: v.Description,
-				})
-				if err != nil {
-					return fmt.Errorf(
-						"Error asking for %s: %s", n, err)
-				}
-
-				if value == "" && v.Required() {
-					// Redo if it is required, but abort if we keep getting
-					// blank entries
-					if retry > 2 {
-						return fmt.Errorf("missing required value for %q", n)
-					}
-					retry++
-					continue
-				}
-
-				break
-			}
-
-			// no value provided, so don't set the variable at all
-			if value == "" {
-				continue
-			}
-
-			decoded, err := parseVariableAsHCL(n, value, valueType)
-			if err != nil {
-				return err
-			}
-
-			if decoded != nil {
-				c.variables[n] = decoded
-			}
-		}
-	}
-
-	if mode&InputModeProvider != 0 {
-		// Build the graph
-		graph, err := c.Graph(GraphTypeInput, nil)
-		if err != nil {
-			return err
-		}
-
-		// Do the walk
-		if _, err := c.walk(graph, walkInput); err != nil {
-			return err
-		}
-	}
-
-	return nil
+// Interpolater is no longer used. Use Evaluator instead.
+//
+// The interpolator returned from this function will return an error on any use.
+func (c *Context) Interpolater() *Interpolater {
+	// FIXME: Remove this once all callers are updated to no longer use it.
+	return &Interpolater{}
 }
 
 // Apply applies the changes represented by this context and returns
@@ -484,23 +441,16 @@ func (c *Context) Input(mode InputMode) error {
 //       State() method. Currently the helper/resource testing framework relies
 //       on the absence of a returned state to determine if Destroy can be
 //       called, so that will need to be refactored before this can be changed.
-func (c *Context) Apply() (*State, error) {
+func (c *Context) Apply() (*State, tfdiags.Diagnostics) {
 	defer c.acquireRun("apply")()
-
-	// Check there are no empty target parameter values
-	for _, target := range c.targets {
-		if target == "" {
-			return nil, fmt.Errorf("Target parameter must not have empty value")
-		}
-	}
 
 	// Copy our own state
 	c.state = c.state.DeepCopy()
 
 	// Build the graph.
-	graph, err := c.Graph(GraphTypeApply, nil)
-	if err != nil {
-		return nil, err
+	graph, diags := c.Graph(GraphTypeApply, nil)
+	if diags.HasErrors() {
+		return nil, diags
 	}
 
 	// Determine the operation
@@ -510,15 +460,14 @@ func (c *Context) Apply() (*State, error) {
 	}
 
 	// Walk the graph
-	walker, err := c.walk(graph, operation)
-	if len(walker.ValidationErrors) > 0 {
-		err = multierror.Append(err, walker.ValidationErrors...)
-	}
+	walker, walkDiags := c.walk(graph, operation)
+	diags = diags.Append(walker.NonFatalDiagnostics)
+	diags = diags.Append(walkDiags)
 
 	// Clean out any unused things
 	c.state.prune()
 
-	return c.state, err
+	return c.state, diags
 }
 
 // Plan generates an execution plan for the given context.
@@ -528,21 +477,22 @@ func (c *Context) Apply() (*State, error) {
 //
 // Plan also updates the diff of this context to be the diff generated
 // by the plan, so Apply can be called after.
-func (c *Context) Plan() (*Plan, error) {
+func (c *Context) Plan() (*Plan, tfdiags.Diagnostics) {
 	defer c.acquireRun("plan")()
 
-	// Check there are no empty target parameter values
-	for _, target := range c.targets {
-		if target == "" {
-			return nil, fmt.Errorf("Target parameter must not have empty value")
-		}
+	// The Plan struct wants the legacy-style of targets as a simple []string,
+	// so we must shim that here.
+	legacyTargets := make([]string, len(c.targets))
+	for i, addr := range c.targets {
+		legacyTargets[i] = addr.String()
 	}
 
+	var diags tfdiags.Diagnostics
 	p := &Plan{
-		Module:  c.module,
-		Vars:    c.variables,
+		Config:  c.config,
+		Vars:    c.variables.JustValues(),
 		State:   c.state,
-		Targets: c.targets,
+		Targets: legacyTargets,
 
 		TerraformVersion: version.String(),
 		ProviderSHA256s:  c.providerSHA256s,
@@ -581,15 +531,18 @@ func (c *Context) Plan() (*Plan, error) {
 	if c.destroy {
 		graphType = GraphTypePlanDestroy
 	}
-	graph, err := c.Graph(graphType, nil)
-	if err != nil {
-		return nil, err
+	graph, graphDiags := c.Graph(graphType, nil)
+	diags = diags.Append(graphDiags)
+	if graphDiags.HasErrors() {
+		return nil, diags
 	}
 
 	// Do the walk
-	walker, err := c.walk(graph, operation)
-	if err != nil {
-		return nil, err
+	walker, walkDiags := c.walk(graph, operation)
+	diags = diags.Append(walker.NonFatalDiagnostics)
+	diags = diags.Append(walkDiags)
+	if walkDiags.HasErrors() {
+		return nil, diags
 	}
 	p.Diff = c.diff
 
@@ -604,23 +557,7 @@ func (c *Context) Plan() (*Plan, error) {
 		p.Diff.DeepCopy()
 	}
 
-	/*
-		// We don't do the reverification during the new destroy plan because
-		// it will use a different apply process.
-		if X_legacyGraph {
-			// Now that we have a diff, we can build the exact graph that Apply will use
-			// and catch any possible cycles during the Plan phase.
-			if _, err := c.Graph(GraphTypeLegacy, nil); err != nil {
-				return nil, err
-			}
-		}
-	*/
-
-	var errs error
-	if len(walker.ValidationErrors) > 0 {
-		errs = multierror.Append(errs, walker.ValidationErrors...)
-	}
-	return p, errs
+	return p, diags
 }
 
 // Refresh goes through all the resources in the state and refreshes them
@@ -629,27 +566,29 @@ func (c *Context) Plan() (*Plan, error) {
 //
 // Even in the case an error is returned, the state may be returned and
 // will potentially be partially updated.
-func (c *Context) Refresh() (*State, error) {
+func (c *Context) Refresh() (*State, tfdiags.Diagnostics) {
 	defer c.acquireRun("refresh")()
 
 	// Copy our own state
 	c.state = c.state.DeepCopy()
 
 	// Build the graph.
-	graph, err := c.Graph(GraphTypeRefresh, nil)
-	if err != nil {
-		return nil, err
+	graph, diags := c.Graph(GraphTypeRefresh, nil)
+	if diags.HasErrors() {
+		return nil, diags
 	}
 
 	// Do the walk
-	if _, err := c.walk(graph, walkRefresh); err != nil {
-		return nil, err
+	_, walkDiags := c.walk(graph, walkRefresh)
+	diags = diags.Append(walkDiags)
+	if walkDiags.HasErrors() {
+		return nil, diags
 	}
 
 	// Clean out any unused things
 	c.state.prune()
 
-	return c.state, nil
+	return c.state, diags
 }
 
 // Stop stops the running task.
@@ -681,26 +620,26 @@ func (c *Context) Stop() {
 	log.Printf("[WARN] terraform: stop complete")
 }
 
-// Validate validates the configuration and returns any warnings or errors.
+// Validate performs semantic validation of the configuration, and returning
+// any warnings or errors.
+//
+// Syntax and structural checks are performed by the configuration loader,
+// and so are not repeated here.
 func (c *Context) Validate() tfdiags.Diagnostics {
 	defer c.acquireRun("validate")()
 
 	var diags tfdiags.Diagnostics
 
-	// Validate the configuration itself
-	diags = diags.Append(c.module.Validate())
-
-	// This only needs to be done for the root module, since inter-module
-	// variables are validated in the module tree.
-	if config := c.module.Config(); config != nil {
-		// Validate the user variables
-		for _, err := range smcUserVariables(config, c.variables) {
-			diags = diags.Append(err)
-		}
+	// Validate input variables. We do this only for the values supplied
+	// by the root module, since child module calls are validated when we
+	// visit their graph nodes.
+	if c.config != nil {
+		varDiags := checkInputVariables(c.config.Module.Variables, c.variables)
+		diags = diags.Append(varDiags)
 	}
 
-	// If we have errors at this point, the graphing has no chance,
-	// so just bail early.
+	// If we have errors at this point then we probably won't be able to
+	// construct a graph without producing redundant errors, so we'll halt early.
 	if diags.HasErrors() {
 		return diags
 	}
@@ -709,48 +648,41 @@ func (c *Context) Validate() tfdiags.Diagnostics {
 	// We also validate the graph generated here, but this graph doesn't
 	// necessarily match the graph that Plan will generate, so we'll validate the
 	// graph again later after Planning.
-	graph, err := c.Graph(GraphTypeValidate, nil)
-	if err != nil {
-		diags = diags.Append(err)
+	graph, graphDiags := c.Graph(GraphTypeValidate, nil)
+	diags = diags.Append(graphDiags)
+	if graphDiags.HasErrors() {
 		return diags
 	}
 
 	// Walk
-	walker, err := c.walk(graph, walkValidate)
-	if err != nil {
-		diags = diags.Append(err)
-	}
-
-	sort.Strings(walker.ValidationWarnings)
-	sort.Slice(walker.ValidationErrors, func(i, j int) bool {
-		return walker.ValidationErrors[i].Error() < walker.ValidationErrors[j].Error()
-	})
-
-	for _, warn := range walker.ValidationWarnings {
-		diags = diags.Append(tfdiags.SimpleWarning(warn))
-	}
-	for _, err := range walker.ValidationErrors {
-		diags = diags.Append(err)
+	walker, walkDiags := c.walk(graph, walkValidate)
+	diags = diags.Append(walker.NonFatalDiagnostics)
+	diags = diags.Append(walkDiags)
+	if walkDiags.HasErrors() {
+		return diags
 	}
 
 	return diags
 }
 
-// Module returns the module tree associated with this context.
-func (c *Context) Module() *module.Tree {
-	return c.module
+// Config returns the configuration tree associated with this context.
+func (c *Context) Config() *configs.Config {
+	return c.config
 }
 
 // Variables will return the mapping of variables that were defined
 // for this Context. If Input was called, this mapping may be different
 // than what was given.
-func (c *Context) Variables() map[string]interface{} {
+func (c *Context) Variables() InputValues {
 	return c.variables
 }
 
 // SetVariable sets a variable after a context has already been built.
-func (c *Context) SetVariable(k string, v interface{}) {
-	c.variables[k] = v
+func (c *Context) SetVariable(k string, v cty.Value) {
+	c.variables[k] = &InputValue{
+		Value:      v,
+		SourceType: ValueFromCaller,
+	}
 }
 
 func (c *Context) acquireRun(phase string) func() {
@@ -807,30 +739,31 @@ func (c *Context) releaseRun() {
 	c.runContext = nil
 }
 
-func (c *Context) walk(graph *Graph, operation walkOperation) (*ContextGraphWalker, error) {
-	// Keep track of the "real" context which is the context that does
-	// the real work: talking to real providers, modifying real state, etc.
-	realCtx := c
-
+func (c *Context) walk(graph *Graph, operation walkOperation) (*ContextGraphWalker, tfdiags.Diagnostics) {
 	log.Printf("[DEBUG] Starting graph walk: %s", operation.String())
 
-	walker := &ContextGraphWalker{
-		Context:     realCtx,
-		Operation:   operation,
-		StopContext: c.runContext,
-	}
+	walker := c.graphWalker(operation)
 
 	// Watch for a stop so we can call the provider Stop() API.
 	watchStop, watchWait := c.watchStop(walker)
 
 	// Walk the real graph, this will block until it completes
-	realErr := graph.Walk(walker)
+	diags := graph.Walk(walker)
 
 	// Close the channel so the watcher stops, and wait for it to return.
 	close(watchStop)
 	<-watchWait
 
-	return walker, realErr
+	return walker, diags
+}
+
+func (c *Context) graphWalker(operation walkOperation) *ContextGraphWalker {
+	return &ContextGraphWalker{
+		Context:            c,
+		Operation:          operation,
+		StopContext:        c.runContext,
+		RootVariableValues: c.variables,
+	}
 }
 
 // watchStop immediately returns a `stop` and a `wait` chan after dispatching

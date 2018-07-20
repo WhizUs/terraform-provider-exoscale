@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/terraform/config/module"
 	"github.com/hashicorp/terraform/dag"
 )
 
@@ -13,18 +12,9 @@ import (
 //
 // This transform is used for example by the ApplyGraphBuilder to ensure
 // that only resources that are being modified are represented in the graph.
-//
-// Module and State is still required for the DiffTransformer for annotations
-// since the Diff doesn't contain all the information required to build the
-// complete graph (such as create-before-destroy information). The graph
-// is built based on the diff first, though, ensuring that only resources
-// that are being modified are present in the graph.
 type DiffTransformer struct {
-	Concrete ConcreteResourceNodeFunc
-
-	Diff   *Diff
-	Module *module.Tree
-	State  *State
+	Concrete ConcreteResourceInstanceNodeFunc
+	Diff     *Diff
 }
 
 func (t *DiffTransformer) Transform(g *Graph) error {
@@ -47,26 +37,30 @@ func (t *DiffTransformer) Transform(g *Graph) error {
 			// We have changes! This is a create or update operation.
 			// First grab the address so we have a unique way to
 			// reference this resource.
-			addr, err := parseResourceAddressInternal(name)
+			legacyAddr, err := parseResourceAddressInternal(name)
 			if err != nil {
 				panic(fmt.Sprintf(
 					"Error parsing internal name, this is a bug: %q", name))
 			}
 
-			// Very important: add the module path for this resource to
-			// the address. Remove "root" from it.
-			addr.Path = m.Path[1:]
+			// legacyAddr is relative even though the legacy ResourceAddress is
+			// usually absolute, so we need to do some trickery here to get
+			// a new-style absolute address in the right module.
+			// FIXME: Clean this up once the "Diff" types are updated to use
+			// our new address types.
+			addr := legacyAddr.AbsResourceInstanceAddr()
+			addr = addr.Resource.Absolute(normalizeModulePath(m.Path))
 
 			// If we're destroying, add the destroy node
 			if inst.Destroy || inst.GetDestroyDeposed() {
-				abstract := &NodeAbstractResource{Addr: addr}
-				g.Add(&NodeDestroyResource{NodeAbstractResource: abstract})
+				abstract := NewNodeAbstractResourceInstance(addr)
+				g.Add(&NodeDestroyResourceInstance{NodeAbstractResourceInstance: abstract})
 			}
 
 			// If we have changes, then add the applyable version
 			if len(inst.Attributes) > 0 {
 				// Add the resource to the graph
-				abstract := &NodeAbstractResource{Addr: addr}
+				abstract := NewNodeAbstractResourceInstance(addr)
 				var node dag.Vertex = abstract
 				if f := t.Concrete; f != nil {
 					node = f(abstract)

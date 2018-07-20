@@ -2,6 +2,9 @@ package terraform
 
 import (
 	"fmt"
+
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/tfdiags"
 )
 
 // ImportStateTransformer is a GraphTransformer that adds nodes to the
@@ -11,64 +14,61 @@ type ImportStateTransformer struct {
 }
 
 func (t *ImportStateTransformer) Transform(g *Graph) error {
-	nodes := make([]*graphNodeImportState, 0, len(t.Targets))
 	for _, target := range t.Targets {
-		addr, err := ParseResourceAddress(target.Addr)
-		if err != nil {
-			return fmt.Errorf(
-				"failed to parse resource address '%s': %s",
-				target.Addr, err)
-		}
-
-		nodes = append(nodes, &graphNodeImportState{
-			Addr:         addr,
+		node := &graphNodeImportState{
+			Addr:         target.Addr,
 			ID:           target.ID,
-			ProviderName: target.Provider,
-		})
+			ProviderAddr: target.ProviderAddr,
+		}
+		g.Add(node)
 	}
-
-	// Build the graph vertices
-	for _, n := range nodes {
-		g.Add(n)
-	}
-
 	return nil
 }
 
 type graphNodeImportState struct {
-	Addr             *ResourceAddress // Addr is the resource address to import to
-	ID               string           // ID is the ID to import as
-	ProviderName     string           // Provider string
-	ResolvedProvider string           // provider node address
+	Addr             addrs.AbsResourceInstance // Addr is the resource address to import into
+	ID               string                    // ID is the ID to import as
+	ProviderAddr     addrs.AbsProviderConfig   // Provider address given by the user, or implied by the resource type
+	ResolvedProvider addrs.AbsProviderConfig   // provider node address after resolution
 
 	states []*InstanceState
 }
 
+var (
+	_ GraphNodeSubPath           = (*graphNodeImportState)(nil)
+	_ GraphNodeEvalable          = (*graphNodeImportState)(nil)
+	_ GraphNodeProviderConsumer  = (*graphNodeImportState)(nil)
+	_ GraphNodeDynamicExpandable = (*graphNodeImportState)(nil)
+)
+
 func (n *graphNodeImportState) Name() string {
-	return fmt.Sprintf("%s (import id: %s)", n.Addr, n.ID)
+	return fmt.Sprintf("%s (import id %q)", n.Addr, n.ID)
 }
 
-func (n *graphNodeImportState) ProvidedBy() string {
-	return resourceProvider(n.Addr.Type, n.ProviderName)
+// GraphNodeProviderConsumer
+func (n *graphNodeImportState) ProvidedBy() (addrs.AbsProviderConfig, bool) {
+	// We assume that n.ProviderAddr has been properly populated here.
+	// It's the responsibility of the code creating a graphNodeImportState
+	// to populate this, possibly by calling DefaultProviderConfig() on the
+	// resource address to infer an implied provider from the resource type
+	// name.
+	return n.ProviderAddr, false
 }
 
-func (n *graphNodeImportState) SetProvider(p string) {
-	n.ResolvedProvider = p
+// GraphNodeProviderConsumer
+func (n *graphNodeImportState) SetProvider(addr addrs.AbsProviderConfig) {
+	n.ResolvedProvider = addr
 }
 
 // GraphNodeSubPath
-func (n *graphNodeImportState) Path() []string {
-	return normalizeModulePath(n.Addr.Path)
+func (n *graphNodeImportState) Path() addrs.ModuleInstance {
+	return n.Addr.Module
 }
 
 // GraphNodeEvalable impl.
 func (n *graphNodeImportState) EvalTree() EvalNode {
 	var provider ResourceProvider
-	info := &InstanceInfo{
-		Id:         fmt.Sprintf("%s.%s", n.Addr.Type, n.Addr.Name),
-		ModulePath: n.Path(),
-		Type:       n.Addr.Type,
-	}
+	info := NewInstanceInfo(n.Addr)
 
 	// Reset our states
 	n.states = nil
@@ -77,7 +77,7 @@ func (n *graphNodeImportState) EvalTree() EvalNode {
 	return &EvalSequence{
 		Nodes: []EvalNode{
 			&EvalGetProvider{
-				Name:   n.ResolvedProvider,
+				Addr:   n.ResolvedProvider,
 				Output: &provider,
 			},
 			&EvalImportState{
@@ -97,6 +97,8 @@ func (n *graphNodeImportState) EvalTree() EvalNode {
 // resources they don't depend on anything else and refreshes are isolated
 // so this is nearly a perfect use case for dynamic expand.
 func (n *graphNodeImportState) DynamicExpand(ctx EvalContext) (*Graph, error) {
+	var diags tfdiags.Diagnostics
+
 	g := &Graph{Path: ctx.Path()}
 
 	// nameCounter is used to de-dup names in the state.
@@ -105,11 +107,11 @@ func (n *graphNodeImportState) DynamicExpand(ctx EvalContext) (*Graph, error) {
 	// Compile the list of addresses that we'll be inserting into the state.
 	// We do this ahead of time so we can verify that we aren't importing
 	// something that already exists.
-	addrs := make([]*ResourceAddress, len(n.states))
+	addrs := make([]addrs.AbsResourceInstance, len(n.states))
 	for i, state := range n.states {
-		addr := *n.Addr
+		addr := n.Addr
 		if t := state.Ephemeral.Type; t != "" {
-			addr.Type = t
+			addr.Resource.Resource.Type = t
 		}
 
 		// Determine if we need to suffix the name to de-dup
@@ -117,12 +119,12 @@ func (n *graphNodeImportState) DynamicExpand(ctx EvalContext) (*Graph, error) {
 		count, ok := nameCounter[key]
 		if ok {
 			count++
-			addr.Name += fmt.Sprintf("-%d", count)
+			addr.Resource.Resource.Name += fmt.Sprintf("-%d", count)
 		}
 		nameCounter[key] = count
 
 		// Add it to our list
-		addrs[i] = &addr
+		addrs[i] = addr
 	}
 
 	// Verify that all the addresses are clear
@@ -133,19 +135,26 @@ func (n *graphNodeImportState) DynamicExpand(ctx EvalContext) (*Graph, error) {
 	for _, addr := range addrs {
 		result, err := filter.Filter(addr.String())
 		if err != nil {
-			return nil, fmt.Errorf("Error verifying address %s: %s", addr, err)
+			diags = diags.Append(fmt.Errorf("Error while checking for existing %s in state: %s", addr, err))
+			continue
 		}
 
 		// Go through the filter results and it is an error if we find
 		// a matching InstanceState, meaning that we would have a collision.
 		for _, r := range result {
-			if _, ok := r.Value.(*InstanceState); ok {
-				return nil, fmt.Errorf(
-					"Can't import %s, would collide with an existing resource.\n\n"+
-						"Please remove or rename this resource before continuing.",
-					addr)
+			if is, ok := r.Value.(*InstanceState); ok {
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"Resource already managed by Terraform",
+					fmt.Sprintf("Terraform is already managing a remote object for %s, with the id %q. To import to this address you must first remove the existing object from the state.", addr, is.ID),
+				))
+				continue
 			}
 		}
+	}
+	if diags.HasErrors() {
+		// Bail out early, then.
+		return nil, diags.Err()
 	}
 
 	// For each of the states, we add a node to handle the refresh/add to state.
@@ -154,10 +163,8 @@ func (n *graphNodeImportState) DynamicExpand(ctx EvalContext) (*Graph, error) {
 	// is safe.
 	for i, state := range n.states {
 		g.Add(&graphNodeImportStateSub{
-			Target:           addrs[i],
-			Path_:            n.Path(),
+			TargetAddr:       addrs[i],
 			State:            state,
-			ProviderName:     n.ProviderName,
 			ResolvedProvider: n.ResolvedProvider,
 		})
 	}
@@ -169,77 +176,67 @@ func (n *graphNodeImportState) DynamicExpand(ctx EvalContext) (*Graph, error) {
 	}
 
 	// Done!
-	return g, nil
+	return g, diags.Err()
 }
 
 // graphNodeImportStateSub is the sub-node of graphNodeImportState
 // and is part of the subgraph. This node is responsible for refreshing
 // and adding a resource to the state once it is imported.
 type graphNodeImportStateSub struct {
-	Target           *ResourceAddress
+	TargetAddr       addrs.AbsResourceInstance
 	State            *InstanceState
-	Path_            []string
-	ProviderName     string
-	ResolvedProvider string
+	ResolvedProvider addrs.AbsProviderConfig
 }
+
+var (
+	_ GraphNodeSubPath  = (*graphNodeImportStateSub)(nil)
+	_ GraphNodeEvalable = (*graphNodeImportStateSub)(nil)
+)
 
 func (n *graphNodeImportStateSub) Name() string {
-	return fmt.Sprintf("import %s result: %s", n.Target, n.State.ID)
+	return fmt.Sprintf("import %s result: %s", n.TargetAddr, n.State.ID)
 }
 
-func (n *graphNodeImportStateSub) Path() []string {
-	return n.Path_
+func (n *graphNodeImportStateSub) Path() addrs.ModuleInstance {
+	return n.TargetAddr.Module
 }
 
 // GraphNodeEvalable impl.
 func (n *graphNodeImportStateSub) EvalTree() EvalNode {
 	// If the Ephemeral type isn't set, then it is an error
 	if n.State.Ephemeral.Type == "" {
-		err := fmt.Errorf(
-			"import of %s didn't set type for %s",
-			n.Target.String(), n.State.ID)
+		err := fmt.Errorf("import of %s didn't set type for %q", n.TargetAddr.String(), n.State.ID)
 		return &EvalReturnError{Error: &err}
 	}
 
 	// DeepCopy so we're only modifying our local copy
 	state := n.State.DeepCopy()
 
-	// Build the resource info
-	info := &InstanceInfo{
-		Id:         fmt.Sprintf("%s.%s", n.Target.Type, n.Target.Name),
-		ModulePath: n.Path_,
-		Type:       n.State.Ephemeral.Type,
-	}
-
 	// Key is the resource key
-	key := &ResourceStateKey{
-		Name:  n.Target.Name,
-		Type:  info.Type,
-		Index: n.Target.Index,
-	}
+	key := NewLegacyResourceInstanceAddress(n.TargetAddr).stateId()
 
 	// The eval sequence
 	var provider ResourceProvider
 	return &EvalSequence{
 		Nodes: []EvalNode{
 			&EvalGetProvider{
-				Name:   n.ResolvedProvider,
+				Addr:   n.ResolvedProvider,
 				Output: &provider,
 			},
 			&EvalRefresh{
+				Addr:     n.TargetAddr.Resource,
 				Provider: &provider,
 				State:    &state,
-				Info:     info,
 				Output:   &state,
 			},
 			&EvalImportStateVerify{
-				Info:  info,
+				Addr:  n.TargetAddr.Resource,
 				Id:    n.State.ID,
 				State: &state,
 			},
 			&EvalWriteState{
-				Name:         key.String(),
-				ResourceType: info.Type,
+				Name:         key,
+				ResourceType: n.TargetAddr.Resource.Resource.Type,
 				Provider:     n.ResolvedProvider,
 				State:        &state,
 			},

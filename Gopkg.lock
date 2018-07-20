@@ -193,6 +193,8 @@
   branch = "master"
   name = "github.com/hashicorp/hcl2"
   packages = [
+    "ext/dynblock",
+    "ext/typeexpr",
     "gohcl",
     "hcl",
     "hcl/hclsyntax",
@@ -220,12 +222,16 @@
   revision = "0dc08b1671f34c4250ce212759ebd880f743d883"
 
 [[projects]]
+  branch = "v0.12-dev"
   name = "github.com/hashicorp/terraform"
   packages = [
+    "addrs",
     "config",
-    "config/configschema",
     "config/hcl2shim",
     "config/module",
+    "configs",
+    "configs/configload",
+    "configs/configschema",
     "dag",
     "flatmap",
     "helper/config",
@@ -237,6 +243,8 @@
     "helper/structure",
     "helper/validation",
     "httpclient",
+    "lang",
+    "lang/funcs",
     "moduledeps",
     "plugin",
     "plugin/discovery",
@@ -250,8 +258,7 @@
     "tfdiags",
     "version"
   ]
-  revision = "41e50bd32a8825a84535e353c3674af8ce799161"
-  version = "v0.11.7"
+  revision = "e70b1ed5e48c4fb25063ef7d926d490df1ef108a"
 
 [[projects]]
   branch = "master"
@@ -345,6 +352,15 @@
     "match"
   ]
   revision = "98eb9847f27ba2008d380a32c98be474dea55bdf"
+  version = "v1.1.1"
+
+[[projects]]
+  name = "github.com/spf13/afero"
+  packages = [
+    ".",
+    "mem"
+  ]
+  revision = "787d034dfe70e44075ccc060d346146ef53270ad"
   version = "v1.1.1"
 
 [[projects]]
@@ -474,6 +490,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "a763cbee2c56e44d023adbdddc7185bce872987158fd66c76c2dbbd9c9283207"
+  inputs-digest = "e84ac05898766b7d0c7c6cabd7982350106562376c7399409aadc03ce65814ea"
   solver-name = "gps-cdcl"
   solver-version = 1

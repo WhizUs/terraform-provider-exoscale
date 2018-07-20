@@ -2,6 +2,9 @@ package terraform
 
 import (
 	"fmt"
+	"log"
+
+	"github.com/hashicorp/terraform/addrs"
 )
 
 // EvalReadState is an EvalNode implementation that reads the
@@ -130,14 +133,19 @@ func (n *EvalUpdateStateHook) Eval(ctx EvalContext) (interface{}, error) {
 type EvalWriteState struct {
 	Name         string
 	ResourceType string
-	Provider     string
+	Provider     addrs.AbsProviderConfig
 	Dependencies []string
 	State        **InstanceState
 }
 
 func (n *EvalWriteState) Eval(ctx EvalContext) (interface{}, error) {
-	return writeInstanceToState(ctx, n.Name, n.ResourceType, n.Provider, n.Dependencies,
+	return writeInstanceToState(ctx, n.Name, n.ResourceType, n.Provider.String(), n.Dependencies,
 		func(rs *ResourceState) error {
+			if *n.State != nil {
+				log.Printf("[TRACE] EvalWriteState: %s has non-nil state", n.Name)
+			} else {
+				log.Printf("[TRACE] EvalWriteState: %s has nil state", n.Name)
+			}
 			rs.Primary = *n.State
 			return nil
 		},
@@ -206,6 +214,7 @@ func writeInstanceToState(
 	rs.Type = resourceType
 	rs.Dependencies = dependencies
 	rs.Provider = provider
+	log.Printf("[TRACE] Saving state for %s, managed by %s", resourceName, provider)
 
 	if err := writerFn(rs); err != nil {
 		return nil, err
