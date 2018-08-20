@@ -17,23 +17,25 @@ Requirements
 Building The Provider
 ---------------------
 
-Clone repository to: `$GOPATH/src/github.com/terraform-providers/terraform-provider-exoscale`
+Clone repository to: `$GOPATH/src/github.com/exoscale/terraform-provider-exoscale`
 
 ```sh
-$ mkdir -p $GOPATH/src/github.com/terraform-providers; cd $GOPATH/src/github.com/terraform-providers
-$ git clone git@github.com:terraform-providers/terraform-provider-exoscale
+$ mkdir -p $GOPATH/src/github.com/exoscale; cd $GOPATH/src/github.com/exoscale
+$ git clone git@github.com:exoscale/terraform-provider-exoscale
 ```
 
 Enter the provider directory and build the provider
 
 ```sh
-$ cd $GOPATH/src/github.com/terraform-providers/terraform-provider-exoscale
+$ cd $GOPATH/src/github.com/exoscale/terraform-provider-exoscale
 $ make build
 ```
 
+After the build the binary terraform-provider-exoscale is available in $GOPATH/bin.
+
 Using the provider
 ----------------------
-If you're building the provider, follow the instructions to [install it as a plugin.](https://www.terraform.io/docs/plugins/basics.html#installing-a-plugin) After placing it into your plugins directory,  run `terraform init` to initialize it.
+If you're building the provider, follow the instructions to [install it as a plugin.](https://www.terraform.io/docs/plugins/basics.html#installing-a-plugin) After placing it into your terraform plugins directory,  run `terraform init` to initialize it.
 
 Developing the Provider
 ---------------------------
